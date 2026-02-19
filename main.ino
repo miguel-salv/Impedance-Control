@@ -1,4 +1,4 @@
-#include <Servo.h>
+#include <TeensyStep.h>
 
 /**
  * This code has been developed as part of the CMU Hackerfab Automatic 
@@ -11,13 +11,23 @@
  */
 
 // Define pins
-const int tx_dialPin = 39;                // == 14. Potentiometer for tx_servo
-const int ant_dialPin = 38;               // == 15. Potentiometer for ant_servo
+const int tx_dialPin = 39;                // Potentiometer for tx_stepper
+const int ant_dialPin = 38;               // Potentiometer for ant_stepper
 const int switchPin = 32;                 // Switch to toggle between states
-const int tx_servoPin = 0;                // Control pin for tx_servo
-const int ant_servoPin = 23;              // Control pin for ant_servo
+const int tx_stepPin = 0;                 // STEP pin for TX
+const int tx_dirPin = 1;                  // DIR pin for TX
+const int ant_stepPin = 2;                // STEP pin for ANT
+const int ant_dirPin = 3;                 // DIR pin for ANT
+const int tx_enablePin = 4;               // ENABLE for TX
+const int ant_enablePin = 5;              // ENABLE for ANT
 const int vswrPin = A0;                   // Forward voltage pin
 const int vswrRevPin = A1;                // Reverse voltage pin
+
+// Stepper motor config
+const float STEPS_PER_REV = 200.0;
+const float STEPS_PER_DEGREE = STEPS_PER_REV / 360.0;
+const float MAX_SPEED_STEPS = 2000.0;     // steps/s 
+const float ACCEL_STEPS = 5000.0;         // steps/s^2
 
 // SWR configuration constants
 const int AVG_SAMPLES = 20;               // Number of samples to average
@@ -30,9 +40,10 @@ const float TARGET_SWR = 1.2;             // Target SWR threshold
 const int SERVO_STEP = 2;                 // Degrees to move
 const unsigned long TUNE_INTERVAL = 75;   // Auto-tune interval in ms
 
-// Create servo objects
-Servo tx_servo;
-Servo ant_servo;
+// Create stepper objects
+Stepper tx_stepper(tx_stepPin, tx_dirPin);
+Stepper ant_stepper(ant_stepPin, ant_dirPin);
+StepControl<> stepController;
 
 // Define states
 enum State { AUTOMATED, MANUAL };
@@ -48,21 +59,37 @@ unsigned long last_tune_time = 0;         // Time for timing control
 // Forward declarations
 float measureSWR();
 float readAverage(int pin);
+long angleToSteps(float angle);
+float stepsToAngle(long steps);
 
-/* Setup servos/ADC */
+/* Setup steppers and ADC */
 void setup() {
-  tx_servo.attach(tx_servoPin);
-  ant_servo.attach(ant_servoPin);
-
   Serial.begin(115200);
+
+  // Enable motor drivers
+  pinMode(tx_enablePin, OUTPUT);
+  pinMode(ant_enablePin, OUTPUT);
+  digitalWrite(tx_enablePin, LOW);
+  digitalWrite(ant_enablePin, LOW);
+
+  tx_stepper.setMaxSpeed(MAX_SPEED_STEPS);
+  tx_stepper.setAcceleration(ACCEL_STEPS);
+  tx_stepper.setPosition(angleToSteps(90)); // Start at 90°
+  ant_stepper.setMaxSpeed(MAX_SPEED_STEPS);
+  ant_stepper.setAcceleration(ACCEL_STEPS);
+  ant_stepper.setPosition(angleToSteps(90));
+
+  if (!stepController.isOk()) {
+    Serial.println("StepController init failed");
+  }
 
   // Configure ADC resolution for Teensy
   analogReadResolution(12); // 4095 max value
-  
+
   pinMode(switchPin, INPUT_PULLUP);
   pinMode(vswrPin, INPUT);
   pinMode(vswrRevPin, INPUT);
-  
+
   delay(100);
   Serial.println("Impedance Matching Ready");
 }
@@ -75,16 +102,16 @@ void loop() {
   // Reset state when switching to AUTOMATED
   if (new_state == AUTOMATED && state == MANUAL) {
     first_auto_run = true;
-    current_tx_angle = tx_servo.read();
+    current_tx_angle = (int)round(stepsToAngle(tx_stepper.getPosition()));
   }
-  
+
   state = new_state;
   if (state == AUTOMATED) {
     controlServosAutomated();
   } else {
     controlServosManual();
   }
-  
+
   delay(10); // Keep loop responsive
 }
 
@@ -132,11 +159,12 @@ void controlServosAutomated() {
   
   // Try moving in current direction
   int new_angle = constrain(current_tx_angle + search_direction, 0, 180);
-  
-  // Move servo
-  tx_servo.write(new_angle);
+
+  // Move stepper and wait until done (blocking)
+  tx_stepper.setTargetAbs(angleToSteps(new_angle));
+  stepController.move(tx_stepper);
   delay(20); // Settling time
-  
+
   // Measure new SWR
   current_swr = measureSWR();
   current_tx_angle = new_angle;
@@ -157,11 +185,14 @@ void controlServosAutomated() {
 
 /* Simple manual control */
 void controlServosManual() {
-  int tx_angle = map(analogRead(tx_dialPin), 0, 1023, 0, 180);
-  int ant_angle = map(analogRead(ant_dialPin), 0, 1023, 0, 180);
+  int tx_angle = map(analogRead(tx_dialPin), 0, 4095, 0, 180);
+  int ant_angle = map(analogRead(ant_dialPin), 0, 4095, 0, 180);
 
-  tx_servo.write(tx_angle);
-  ant_servo.write(ant_angle);
+  tx_stepper.setTargetAbs(angleToSteps(tx_angle));
+  ant_stepper.setTargetAbs(angleToSteps(ant_angle));
+  if (!stepController.isRunning()) {
+    stepController.moveAsync(tx_stepper, ant_stepper);
+  }
 
   Serial.print("MANUAL | TX:");
   Serial.print(tx_angle);
@@ -171,6 +202,14 @@ void controlServosManual() {
 }
 
 /* Helper functions */
+
+// Map 0–180 to step position
+long angleToSteps(float angle) {
+  return (long)round(angle * STEPS_PER_DEGREE);
+}
+float stepsToAngle(long steps) {
+  return (float)steps / STEPS_PER_DEGREE;
+}
 
 // Smooth out noise with averaging
 float readAverage(int pin) {
