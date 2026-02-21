@@ -6,7 +6,7 @@ const int STEP_PIN_1 = D0;
 const int DIR_PIN_1  = D1;
 const int STEP_PIN_2 = D8;
 const int DIR_PIN_2  = D9;
-const int RX_PIN     = D7; 
+const int RX_PIN     = D7;
 const int TX_PIN     = D6; 
 
 // --- TMC2209 UART CONFIGURATION ---
@@ -19,13 +19,67 @@ TMC2209Stepper driver1(&SERIAL_PORT, R_SENSE, DRV_ADDRESS_1);
 TMC2209Stepper driver2(&SERIAL_PORT, R_SENSE, DRV_ADDRESS_2);
 
 // --- SETTINGS ---
-#define STALL_VALUE 100           
+#define STALL_VALUE 140           
 #define STEP_DELAY  200           
-#define POLL_INTERVAL 50          
+#define POLL_INTERVAL 10          
+
+
+//--- MECH SPECS ---
+#define STEPS_PER_RAD 63.66197f
+#define MICROSTEPS_PER_STEP 16
+#define MAX_ROT 3.14159f
+#define GRAD_SCALE 0.01f
+
+#define GRAD_DEADBAND .01f
+
+#define PI 3.14159f
+
+// --- POSITION TRACKING ---
+float motor1_pos = 2 * PI;
+float motor2_pos = 2 * PI;
 
 bool dir1 = true;
 bool dir2 = true;
-bool sequenceComplete = false;
+
+float dM1 = 0.1;
+float dM2 = 0.1;
+
+float SWR;
+
+float turnByRad(TMC2209Stepper &driver, int stepPin, int dirPin, float rads, float &motor_pos, bool ignoreLimits = false) {
+    if (rads == 0.0f) {
+        return 0.0f;
+    }
+
+    bool isNegativeDir = (rads < 0.0f);
+    digitalWrite(dirPin, isNegativeDir);
+    
+    float abs_rads = isNegativeDir ? -rads : rads;
+    int total_steps = radToSteps(abs_rads);
+    
+    float step_increment = stepsToRad(1);
+    float position_change = isNegativeDir ? -step_increment : step_increment;
+    
+    int steps_taken = 0;
+
+    for (int i = 0; i < total_steps; i++) {
+        if (!ignoreLimits) {
+            bool hittingUpperLimit = (motor_pos >= MAX_ROT && position_change > 0.0f);
+            bool hittingLowerLimit = (motor_pos <= 0.0f && position_change < 0.0f);
+            
+            if (hittingUpperLimit || hittingLowerLimit) {
+                Serial.println("MOTOR LIMIT REACHED");
+                break; 
+            }
+        }
+        
+        takeStep(stepPin);
+        motor_pos += position_change;
+        steps_taken++;
+    }
+
+    return steps_taken * position_change;
+}
 
 void setup() {
   Serial.begin(500000);
@@ -37,7 +91,6 @@ void setup() {
   digitalWrite(DIR_PIN_1, dir1); 
   digitalWrite(DIR_PIN_2, dir2);
 
-  // Initialize UART at 500k as per your successful test
   SERIAL_PORT.begin(500000, SERIAL_8N1, RX_PIN, TX_PIN);
   delay(500);
 
@@ -53,7 +106,7 @@ void setup() {
 
   // Configure Driver 2
   driver2.begin();
-  driver2.toff(5);                 
+  driver2.toff(5);
   driver2.rms_current(800);        
   driver2.microsteps(16);          
   driver2.en_spreadCycle(false);   
@@ -61,66 +114,89 @@ void setup() {
   driver2.TCOOLTHRS(0xFFFFF);    
   driver2.SGTHRS(STALL_VALUE);
 
-  Serial.println("Setup Complete. Starting Sequence...");
+
+  testUART(driver1, 1);
+  testUART(driver2, 2);
+
+  Serial.println("Starting Homing Sequence...");
+  turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, -1 * PI, motor1_pos, true);
+  turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, -1 * PI, motor2_pos, true);
+
+  motor1_pos = 0;
+  motor2_pos = 0;
+  Serial.println("Finished Homing Sequence...");
+
 }
 
 void loop() {
-
-  Serial.println("Homing Motor 1...");
-  runUntilStall(driver1, STEP_PIN_1, DIR_PIN_1, dir1,270);
-  
-  delay(1000); // Small gap between motors for clarity
-
-  Serial.println("Homing Motor 2...");
-  runUntilStall(driver2, STEP_PIN_2, DIR_PIN_2, dir2,250);
-
-  Serial.println("Sequence Complete.");
-
+  calcGradAndStep(driver1, STEP_PIN_1, DIR_PIN_1, dM1, motor1_pos);
+  Serial.print("motor1: "); Serial.print(motor1_pos );
+  calcGradAndStep(driver2, STEP_PIN_2, DIR_PIN_2, dM2, motor2_pos);
+  Serial.print(" motor2: "); Serial.println(motor2_pos);
 }
 
-// Dedicated function to run a motor until stall, then bounce
-void runUntilStall(TMC2209Stepper &driver, int stepPin, int dirPin, bool &currentDir, int threshold) {
-  unsigned long lastPoll = 0;
-  bool stalled = false;
-  //get the motor started
-  for(int i = 0; i < 50; i++) {
-    digitalWrite(stepPin, HIGH);
-    delayMicroseconds(STEP_DELAY / 2);
-    digitalWrite(stepPin, LOW);
-    delayMicroseconds(STEP_DELAY / 2);
-  }
-  while (!stalled) {
-    
-    // 1. Physical Step
-    digitalWrite(stepPin, HIGH);
-    delayMicroseconds(STEP_DELAY / 2);
-    digitalWrite(stepPin, LOW);
-    delayMicroseconds(STEP_DELAY / 2);
-    //Serial.println(driver.SG_RESULT() );
-    // 2. Check StallGuard every 10ms
-    if (millis() - lastPoll >= POLL_INTERVAL) {
-      int pollres = driver.SG_RESULT();
-      Serial.println(pollres);
-      lastPoll = millis();
-      if (pollres < threshold) { 
-        
-        stalled = true;
-      }
+void calcGradAndStep(TMC2209Stepper &driver, int stepPin, int dirPin, float &gradient, float &motor_pos) {
+
+    if (gradient > -GRAD_DEADBAND && gradient < GRAD_DEADBAND) {
+        return;
     }
-  }
 
-  // 3. Bounce Logic (Inherited from your original script)
-  Serial.println("Stall detected! Bouncing...");
-  delay(50); // Resonance settle [cite: 62]
+    float initialCost = calcSWR();
+    Serial.println(gradient);
+    
+    float commandedStepSize = gradient * GRAD_SCALE;
+    
+    float actualTravel = turnByRad(driver, stepPin, dirPin, commandedStepSize, motor_pos);
+
+    if (actualTravel != 0.0f) {
+        gradient = (initialCost - calcSWR()) / actualTravel;
+    }
+}
+
+float calcSWR(){
+  float err1 = motor1_pos - 2 * PI;
+  float err2 = motor2_pos - (PI / 2.0f);
+  return (err1 * err1) + (err2 * err2);
+}
+float stepsToRad(int steps){
+  return steps / (STEPS_PER_RAD * MICROSTEPS_PER_STEP);
+}
+int radToSteps(float rads){
+  return round_up(rads * (STEPS_PER_RAD * MICROSTEPS_PER_STEP));
+}
+
+
+void testUART(TMC2209Stepper &driver, int drivNum){
+  uint8_t conn_result = driver.test_connection();
+  if (conn_result == 0) {
+    Serial.print("UART connection successful: ");
+    Serial.println(drivNum);
+  } else {
+    Serial.print("UART connection FAILED. Error code: ");
+    Serial.println(conn_result);
+    while(1); // Halt the program so you can fix the wiring
+  }
   
-  currentDir = !currentDir;
-  digitalWrite(dirPin, currentDir);
-  
-  // Force 50 steps away from wall [cite: 68]
-  for(int i = 0; i < 50; i++) {
+}
+
+
+void takeStep(int stepPin) {
     digitalWrite(stepPin, HIGH);
     delayMicroseconds(STEP_DELAY / 2);
     digitalWrite(stepPin, LOW);
     delayMicroseconds(STEP_DELAY / 2);
-  }
 }
+
+int round_up(float value) {
+    int truncated = static_cast<int>(value);
+
+    // Casting to int truncates towards zero. 
+    // If the original float is strictly greater than the truncated int, 
+    // it had a positive fractional component that requires bumping up.
+    if (value > truncated) {
+        return truncated + 1;
+    }
+
+    return truncated;
+}
+
